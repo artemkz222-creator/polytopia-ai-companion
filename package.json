@@ -1,11 +1,15 @@
 {
   "name": "polytopia-ai-companion",
   "private": true,
+  "engines": {
+    "node": ">=24"
+  },
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test netlify/server/*.test.mjs",
+    "test": "node --test netlify/server/*.test.mjs tests/*.test.mjs",
+    "typecheck": "tsc -p .",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

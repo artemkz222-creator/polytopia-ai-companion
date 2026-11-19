@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { analyzeScreenshot, validateAnalysis } from "./analysis.mjs";
-import { createHandler } from "./index.mjs";
+import { createHandler, errorMessage } from "./index.mjs";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
 const analysis = {
@@ -82,12 +82,13 @@ test("does not present tactical advice for unrelated images", async () => {
 });
 
 test("handles provider errors and rate limits without exposing upstream diagnostics", async () => {
-  for (const status of [429, 500]) {
+  const expected = { 429: /лимит/, 403: /не активирован/, 500: /Повторите попытку/ };
+  for (const status of [429, 403, 500]) {
     const handler = createHandler({ analyze: async () => { throw Object.assign(new Error("private upstream diagnostic"), { status }); } });
     const output = await events(await handler(request()));
     assert.equal(output.at(-1).type, "error");
     assert.doesNotMatch(JSON.stringify(output), /private upstream diagnostic/);
-    assert.match(output.at(-1).message, status === 429 ? /лимит/ : /Повторите попытку/);
+    assert.match(output.at(-1).message, expected[status]);
   }
 });
 
@@ -131,4 +132,34 @@ test("rejects incomplete, refused, malformed and empty model output", async () =
   assert.equal(validateAnalysis(analysis), true);
   assert.equal(validateAnalysis({ ...analysis, bestMove: "" }), false);
   assert.equal(validateAnalysis({ ...analysis, threeTurnPlan: ["one"] }), false);
+});
+
+test("maps provider failures to clear Russian messages", () => {
+  assert.match(errorMessage({ status: 400 }), /не смог обработать это изображение/);
+  assert.match(errorMessage({ name: "APIConnectionTimeoutError" }), /не ответил вовремя/);
+  assert.match(errorMessage({ name: "APIConnectionError" }), /связаться с сервисом ИИ/);
+  assert.match(errorMessage(new SyntaxError("bad")), /неполный ответ/);
+  assert.match(errorMessage(new Error("Invalid analysis format")), /неполный ответ/);
+});
+
+test("rejects a request without an image file", async () => {
+  const handler = createHandler({ analyze: () => assert.fail("AI must not be called") });
+  const form = new FormData();
+  form.set("context", "");
+  const response = await handler(new Request("https://example.com/api/analyze", { method: "POST", body: form }));
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /Скриншот не передан/);
+});
+
+test("a client disconnect before the AI finishes does not throw or send further events", async () => {
+  let finish;
+  const handler = createHandler({ analyze: () => new Promise(resolve => { finish = resolve; }) });
+  const client = new AbortController();
+  const response = await handler(request({ signal: client.signal }));
+  const reader = response.body.getReader();
+  await reader.read();
+  client.abort();
+  await reader.cancel();
+  finish(analysis);
+  await new Promise(resolve => setTimeout(resolve, 10));
 });
