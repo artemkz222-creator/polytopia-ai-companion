@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test netlify/server/*.test.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
+    "openai": "^7.60.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
