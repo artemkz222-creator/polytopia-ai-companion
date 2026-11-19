@@ -8,6 +8,22 @@ function jsonError(message, status) {
   return Response.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
 }
 
+export function errorMessage(error) {
+  const status = error?.status;
+  const name = error?.name ?? "";
+  if (status === 429) return "Сервис ИИ сейчас перегружен или достигнут лимит запросов. Подождите минуту и повторите попытку.";
+  if (status === 401 || status === 403) {
+    return "ИИ для этого сайта ещё не активирован. Он включается после первой успешной публикации сайта и при наличии кредитов на аккаунте Netlify.";
+  }
+  if (status === 400 || status === 422) return "ИИ не смог обработать это изображение. Попробуйте другой скриншот в формате PNG или JPEG.";
+  if (name.includes("Timeout") || error?.code === "ETIMEDOUT") return "ИИ не ответил вовремя. Повторите попытку через минуту.";
+  if (name.includes("Connection")) return "Не удалось связаться с сервисом ИИ. Повторите попытку через минуту.";
+  if (error instanceof SyntaxError || error?.message === "Incomplete analysis" || error?.message === "Invalid analysis format") {
+    return "ИИ вернул неполный ответ. Повторите попытку.";
+  }
+  return "Не удалось получить анализ от ИИ. Повторите попытку через минуту.";
+}
+
 function matchesImageType(bytes, type) {
   if (type === "image/png") return bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
   if (type === "image/jpeg") return bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
@@ -61,7 +77,8 @@ export function createHandler({ analyze = analyzeScreenshot } = {}) {
     }
     const file = form.get("image");
     const context = form.get("context") ?? "";
-    if (!(file instanceof File) || !allowedTypes.has(file.type)) return jsonError("Поддерживаются PNG, JPEG и WebP.", 415);
+    if (!(file instanceof File)) return jsonError("Скриншот не передан. Выберите изображение и повторите попытку.", 400);
+    if (!allowedTypes.has(file.type)) return jsonError("Поддерживаются только изображения PNG, JPEG и WebP.", 415);
     if (file.size === 0 || file.size > maxImageSize) return jsonError("Нужен непустой файл размером до 6 МБ после подготовки.", 413);
     if (typeof context !== "string" || context.length > 1500) return jsonError("Комментарий должен быть не длиннее 1500 символов.", 400);
     const bytes = Buffer.from(await file.arrayBuffer());
@@ -69,13 +86,19 @@ export function createHandler({ analyze = analyzeScreenshot } = {}) {
 
     const abort = new AbortController();
     const onAbort = () => abort.abort();
-    request.signal.addEventListener("abort", onAbort, { once: true });
-    if (request.signal.aborted) abort.abort();
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) abort.abort();
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
+        let open = true;
         const send = value => {
-          if (!abort.signal.aborted) controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
+          if (!open || abort.signal.aborted) return;
+          try {
+            controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
+          } catch {
+            open = false;
+          }
         };
         // Send headers immediately and keep slow vision requests open on Netlify Server.
         send({ type: "status" });
@@ -83,20 +106,22 @@ export function createHandler({ analyze = analyzeScreenshot } = {}) {
         try {
           const result = await analyze({ type: file.type, bytes }, context.trim(), abort.signal);
           if (result.isGameScreenshot) send({ type: "result", analysis: result });
-          else send({ type: "error", message: `Не удалось разобрать игровое поле. ${result.summary}` });
+          else send({ type: "error", message: `На изображении не удалось распознать игровое поле Polytopia. ${result.summary}`.trim() });
         } catch (error) {
-          console.error("AI analysis failed", {
-            status: Number.isInteger(error?.status) ? error.status : undefined,
-            category: error instanceof SyntaxError ? "invalid-json" : error?.name === "Error" ? "analysis-error" : "provider-error",
-          });
-          const limited = error?.status === 429;
-          send({ type: "error", message: limited
-            ? "Сервис ИИ сейчас перегружен или достигнут лимит запросов. Попробуйте позже."
-            : "Не удалось получить анализ от ИИ. Повторите попытку через минуту." });
+          if (!abort.signal.aborted) {
+            console.error("AI analysis failed", {
+              status: Number.isInteger(error?.status) ? error.status : undefined,
+              name: typeof error?.name === "string" ? error.name : undefined,
+            });
+            send({ type: "error", message: errorMessage(error) });
+          }
         } finally {
           clearInterval(heartbeat);
-          request.signal.removeEventListener("abort", onAbort);
-          if (!abort.signal.aborted) controller.close();
+          request.signal?.removeEventListener("abort", onAbort);
+          if (open) {
+            open = false;
+            try { controller.close(); } catch { /* already cancelled by the client */ }
+          }
         }
       },
       cancel() { abort.abort(); },

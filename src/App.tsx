@@ -3,9 +3,34 @@ import {
   AlertTriangle, ArrowUpRight, Bot, CheckCircle2, Clock3, Coins,
   ImagePlus, LoaderCircle, Map, Save, Shield, Sparkles, Target, Trash2, Upload, X
 } from "lucide-react";
-import { requestAnalysis, type Analysis } from "./analysis";
+import { allowedImageTypes, createThumbnail, maxUploadSize, normalizeImageFile, requestAnalysis, type Analysis } from "./analysis";
 
 type SavedScan = { id: string; name: string; date: string; url: string };
+
+const historyKey = "polytopia-scans";
+
+function newId() {
+  return typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function loadHistory(): SavedScan[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(historyKey) ?? "[]");
+    // Older versions stored blob: URLs, which stop working after a reload.
+    return Array.isArray(saved) ? saved.filter((item): item is SavedScan => typeof item?.url === "string" && item.url.startsWith("data:image/")) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeHistory(items: SavedScan[]): boolean {
+  try {
+    localStorage.setItem(historyKey, JSON.stringify(items));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const tips = [
   { title: "Экономика", icon: Coins, text: "После распознавания скриншота здесь появится оценка дохода, расходов и приоритетов развития." },
@@ -28,24 +53,26 @@ export default function App() {
 
   useEffect(() => () => { requestRef.current?.abort(); }, []);
 
-  useEffect(() => {
-    const saved = localStorage.getItem("polytopia-scans");
-    if (saved) {
-      try { setHistory(JSON.parse(saved) as SavedScan[]); } catch { /* ignore invalid local data */ }
-    }
-  }, []);
+  useEffect(() => { setHistory(loadHistory()); }, []);
 
   useEffect(() => {
     return () => { if (preview.startsWith("blob:")) URL.revokeObjectURL(preview); };
   }, [preview]);
 
-  function selectFile(next: File | undefined) {
-    if (!next) return;
-    if (!["image/png", "image/jpeg", "image/webp"].includes(next.type)) {
-      setError("Поддерживаются PNG, JPEG и WebP.");
+  function selectFile(selected: File | undefined) {
+    // Reset so that choosing the same file again still triggers onChange.
+    if (inputRef.current) inputRef.current.value = "";
+    if (!selected) return;
+    const next = normalizeImageFile(selected);
+    if (!next || !allowedImageTypes.includes(next.type)) {
+      setError("Этот формат не поддерживается. Выберите скриншот PNG, JPEG или WebP.");
       return;
     }
-    if (next.size > 15 * 1024 * 1024) {
+    if (next.size === 0) {
+      setError("Файл пустой. Выберите другой скриншот.");
+      return;
+    }
+    if (next.size > maxUploadSize) {
       setError("Файл слишком большой. Максимальный размер — 15 МБ.");
       return;
     }
@@ -55,7 +82,6 @@ export default function App() {
     setAnalysis(null);
     setError("");
     setMessage("Скриншот готов. Нажмите «Разобрать с ИИ».");
-    if (inputRef.current) inputRef.current.value = "";
   }
 
   function cancelAnalysis() {
@@ -81,7 +107,11 @@ export default function App() {
       setMessage("Анализ готов — рекомендации ниже.");
     } catch (reason) {
       if (requestRef.current !== controller) return;
-      setError(timedOut ? "Анализ занял слишком много времени. Попробуйте ещё раз." : reason instanceof Error ? reason.message : "Не удалось выполнить анализ. Повторите попытку.");
+      setError(timedOut
+        ? "Анализ занял больше 90 секунд и был остановлен. Попробуйте ещё раз."
+        : reason instanceof Error && reason.name !== "AbortError" && reason.message
+          ? reason.message
+          : "Не удалось выполнить анализ. Повторите попытку.");
       setMessage("Скриншот остаётся на экране. Можно повторить анализ.");
     } finally {
       window.clearTimeout(timeout);
@@ -92,24 +122,29 @@ export default function App() {
     }
   }
 
-  function saveToHistory() {
-    if (!file || !preview) return;
-    const item: SavedScan = {
-      id: crypto.randomUUID(),
-      name: file.name,
-      date: new Date().toLocaleString("ru-RU"),
-      url: preview
-    };
+  async function saveToHistory() {
+    if (!file) return;
+    let url: string;
+    try {
+      url = await createThumbnail(file);
+    } catch {
+      setError("Не удалось сохранить снимок в историю. Попробуйте другой файл.");
+      return;
+    }
+    const item: SavedScan = { id: newId(), name: file.name, date: new Date().toLocaleString("ru-RU"), url };
     const next = [item, ...history].slice(0, 8);
+    if (!storeHistory(next)) {
+      setError("Не удалось сохранить историю: память браузера заполнена или недоступна. Удалите старые снимки.");
+      return;
+    }
     setHistory(next);
-    localStorage.setItem("polytopia-scans", JSON.stringify(next));
     setMessage("Запись добавлена в историю на этом устройстве.");
   }
 
   function removeHistory(id: string) {
     const next = history.filter(item => item.id !== id);
     setHistory(next);
-    localStorage.setItem("polytopia-scans", JSON.stringify(next));
+    storeHistory(next);
   }
 
   function clearCurrent() {
